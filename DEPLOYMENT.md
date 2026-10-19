@@ -166,7 +166,12 @@ Why `--no-verify-jwt` (matches `supabase/config.toml`):
 - `process-notifications` is authorised by the `x-cron-secret` header. A gateway JWT check would accept any visitor's anon token, so it is not real authorisation.
 - `manage-staff` verifies the caller's JWT with Supabase Auth inside the function and requires an **active admin** row. With gateway verification on, CORS preflight requests would be rejected.
 
-### Resend sender domain
+### Resend (owner alerts only)
+Each enquiry sends one email: the alert to `OWNER_EMAIL`. Visitors get no automatic email.
+
+**Without a domain:** create the Resend account **with the owner's email address** (the same as `OWNER_EMAIL`) and set `FROM_EMAIL=Mozart School <onboarding@resend.dev>`. Resend's shared `resend.dev` sender only delivers to the account's own address, which is all owner alerts need. Mark the first alert "Not spam" if Gmail filters it.
+
+**With your own domain (needed for staff invitation and reset emails through Supabase SMTP, §6):**
 1. Resend → Domains → add `<your-domain>` and create the DNS records it lists (SPF, DKIM, and optionally DMARC) at your DNS host.
 2. Wait for **Verified**, then create an API key with *Sending access* for that domain.
 3. Use it for `RESEND_API_KEY` and set `FROM_EMAIL` to an address on that domain, e.g. `Mozart School <enquiries@<your-domain>>`.
@@ -329,7 +334,7 @@ curl -sI https://<your-domain>/assets/does-not-exist.js    # 404 (not HTML)
 Then in a browser: open `https://<your-domain>/admin` directly, refresh it, and open `https://<your-domain>/#admin`; all three show the staff sign-in. View the page source: no `noindex` meta tag, and the canonical link is present.
 
 Application:
-1. Submit an enquiry. Expected: success message, an enquiry row, and two `notification_jobs` rows that change to `sent` within about a minute. You should get the owner alert and the acknowledgement.
+1. Submit an enquiry. Expected: success message, an enquiry row, and one `owner_alert` row in `notification_jobs` that changes to `sent` within about a minute, and the owner receives the alert. Visitors get no email (see `20261020000004_owner_alerts_only.sql`).
 2. Sign in at `/admin` as the administrator. Invite a test staff member, accept the invitation in a private window (the link must open `https://<your-domain>/admin/auth/callback…`), set a password, and confirm they can change status and add notes but cannot delete or retry.
 3. Revoke the test staff member and confirm their open dashboard loses access on the next action or when the window regains focus.
 4. Use *Forgot?* on the sign-in screen and complete a password reset.

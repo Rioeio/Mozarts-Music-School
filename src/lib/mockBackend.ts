@@ -145,19 +145,6 @@ const SEED_JOBS: NotificationJob[] = [
     provider_message_id: "mock_resend_101",
     created_at: new Date(Date.now() - 3600 * 1000 * 4).toISOString(),
   },
-  {
-    id: "job-2",
-    enquiry_id: "e100-demo-piano",
-    kind: "visitor_acknowledgement",
-    status: "sent",
-    recipient: "anita.r@example.com",
-    subject: "Thank you for your enquiry — Mozart School Of Western Classical Music",
-    attempts: 1,
-    next_attempt_at: new Date().toISOString(),
-    last_error: null,
-    provider_message_id: "mock_resend_102",
-    created_at: new Date(Date.now() - 3600 * 1000 * 4).toISOString(),
-  },
 ]
 
 const memoryStorage: Record<string, string> = {}
@@ -219,7 +206,8 @@ export const mockBackend = {
     enquiries.unshift(newEnquiry)
     setStored(STORAGE_KEY_ENQUIRIES, enquiries)
 
-    // Queue demo notification jobs (never delivered in demo mode)
+    // Queue the demo owner alert (never delivered in demo mode). Visitors get no
+    // acknowledgement email, matching 20261020000004_owner_alerts_only.sql.
     const jobs = getStored<NotificationJob[]>(STORAGE_KEY_JOBS, SEED_JOBS)
     jobs.push({
       id: "job-" + Math.random().toString(36).substring(2, 9),
@@ -234,21 +222,6 @@ export const mockBackend = {
       provider_message_id: null,
       created_at: new Date().toISOString(),
     })
-    if (newEnquiry.email) {
-      jobs.push({
-        id: "job-" + Math.random().toString(36).substring(2, 9),
-        enquiry_id: newEnquiry.id,
-        kind: "visitor_acknowledgement",
-        status: "pending",
-        recipient: newEnquiry.email,
-        subject: "Thank you for your enquiry — Mozart School",
-        attempts: 1,
-        next_attempt_at: new Date().toISOString(),
-        last_error: null,
-        provider_message_id: null,
-        created_at: new Date().toISOString(),
-      })
-    }
     setStored(STORAGE_KEY_JOBS, jobs)
 
     return newEnquiry

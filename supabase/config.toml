@@ -6,12 +6,48 @@ extra_search_path = ["public"]
 
 [db]
 port = 54322
+major_version = 17
 
 [studio]
 port = 54323
 
+# Local auth settings. Mirror these in the hosted dashboard (see DEPLOYMENT.md).
+[auth]
+site_url = "http://localhost:8443"
+additional_redirect_urls = [
+  "http://localhost:8443/admin/auth/callback",
+  "http://127.0.0.1:8443/admin/auth/callback",
+]
+# Staff accounts are created only by invitation.
+enable_signup = false
+minimum_password_length = 10
+jwt_expiry = 3600
+
+[auth.email]
+enable_signup = false
+enable_confirmations = true
+secure_password_change = true
+
+# Token-hash links open the dashboard, which verifies them. This keeps links
+# working with the site's hash routes and stops email scanners from using them up.
+[auth.email.template.invite]
+subject = "You're invited to the Mozart School staff dashboard"
+content_path = "./supabase/templates/invite.html"
+
+[auth.email.template.recovery]
+subject = "Reset your Mozart School staff password"
+content_path = "./supabase/templates/recovery.html"
+
+# Public: visitors are not signed in. Protected by Turnstile, rate limits, CORS.
 [functions.submit-enquiry]
 verify_jwt = false
 
+# Scheduler only: authorised by the x-cron-secret header inside the function.
 [functions.process-notifications]
-verify_jwt = true
+verify_jwt = false
+
+# Admins only: the function verifies the caller's JWT with Supabase Auth and
+# checks their active admin staff record. Gateway verification is off so CORS
+# preflight requests reach the function.
+[functions.manage-staff]
+verify_jwt = false

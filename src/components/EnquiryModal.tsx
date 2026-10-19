@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { EnquiryType, InstrumentType, LearnerGroupType, ExperienceLevelType, ClassPreference } from "../lib/types"
-import { submitEnquiry } from "../lib/api"
+import { generateIdempotencyKey, submitEnquiry } from "../lib/api"
+import { appConfig } from "../lib/config"
+import TurnstileWidget from "./TurnstileWidget"
 
 interface EnquiryModalProps {
   isOpen: boolean
@@ -37,6 +39,14 @@ export default function EnquiryModal({
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
 
+  // Spam check token (single use) and a submission key reused across retries of
+  // the same form, so a resubmitted request never creates a duplicate enquiry.
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null)
+  const [turnstileReset, setTurnstileReset] = useState(0)
+  const [idempotencyKey, setIdempotencyKey] = useState(generateIdempotencyKey)
+  const needsTurnstile = appConfig.mode === "live"
+  const unavailable = appConfig.mode === "misconfigured"
+
   // Sync state when props change
   useEffect(() => {
     if (isOpen) {
@@ -49,18 +59,82 @@ export default function EnquiryModal({
     }
   }, [isOpen, initialType, initialInstrument])
 
-  // Close on Escape key
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
+
+  // Close on Escape key; keep Tab focus inside the dialog
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && isOpen) {
+      if (!isOpen) return
+      if (e.key === "Escape") {
         onClose()
+      } else if (e.key === "Tab" && dialogRef.current) {
+        const focusable = [
+          ...dialogRef.current.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), [href], input:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]), select:not([disabled]), iframe',
+          ),
+        ].filter((el) => el.offsetParent !== null)
+        if (focusable.length === 0) return
+        const first = focusable[0]
+        const last = focusable[focusable.length - 1]
+        const active = document.activeElement
+        if (e.shiftKey && (active === first || active === dialogRef.current)) {
+          e.preventDefault()
+          last.focus()
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault()
+          first.focus()
+        }
       }
     }
     window.addEventListener("keydown", handleKeyDown)
     return () => window.removeEventListener("keydown", handleKeyDown)
   }, [isOpen, onClose])
 
+  // While open: lock page scroll and move focus into the dialog; on close,
+  // restore both (focus returns to the button that opened it).
+  useEffect(() => {
+    if (!isOpen) return
+    const previousFocus = document.activeElement as HTMLElement | null
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = "hidden"
+    dialogRef.current?.focus()
+    return () => {
+      document.body.style.overflow = previousOverflow
+      previousFocus?.focus()
+    }
+  }, [isOpen])
+
+  // A validation or server error is shown at the top of the scrolling body.
+  useEffect(() => {
+    if (errorMsg) bodyRef.current?.scrollTo({ top: 0 })
+  }, [errorMsg])
+
   if (!isOpen) return null
+
+  const headings: { id: EnquiryType; title: string; intro: string }[] = [
+    {
+      id: "lesson",
+      title: "Make a Lesson Enquiry",
+      intro: "Online and in-person classes are available. Tell us who is learning and what instrument calls to you.",
+    },
+    {
+      id: "location_interest",
+      title: "Register Your Location Interest",
+      intro: "In-person classes are coming soon — A welcoming new space is on the way. Register your interest and we’ll keep you informed.",
+    },
+    {
+      id: "general",
+      title: "Send Us a Note",
+      intro: "Have a question about our classical curriculum or teaching approach? We are here to help.",
+    },
+  ]
+
+  const tabs: { id: EnquiryType; label: string }[] = [
+    { id: "lesson", label: "Lesson Enquiry" },
+    { id: "location_interest", label: "Location Interest" },
+    { id: "general", label: "General Note" },
+  ]
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -78,6 +152,11 @@ export default function EnquiryModal({
 
     if (!contactConsent) {
       setErrorMsg("Please check the box to confirm consent to be contacted.")
+      return
+    }
+
+    if (needsTurnstile && !turnstileToken) {
+      setErrorMsg("Please complete the spam check before submitting.")
       return
     }
 
@@ -99,6 +178,8 @@ export default function EnquiryModal({
       source,
       contactConsent,
       locationUpdates: type === "location_interest" ? true : locationUpdates,
+      turnstileToken: turnstileToken || undefined,
+      idempotencyKey,
       _hp: honeypot,
     }
 
@@ -107,8 +188,13 @@ export default function EnquiryModal({
 
     if (res.ok) {
       setSuccessMsg(res.message)
+      setIdempotencyKey(generateIdempotencyKey())
     } else {
       setErrorMsg(res.message || "An unexpected error occurred. Please try again.")
+    }
+    // The server has consumed the token (or rejected it); get a fresh one.
+    if (needsTurnstile && res.code !== "validation") {
+      setTurnstileReset((n) => n + 1)
     }
   }
 
@@ -119,27 +205,30 @@ export default function EnquiryModal({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs overflow-y-auto"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="modal-title"
-    >
-      <div className="relative w-full max-w-xl bg-white text-black border border-black shadow-2xl p-6 sm:p-10 my-8 max-h-[92vh] overflow-y-auto">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-8 [@media(max-height:560px)]:p-3 bg-black/70 backdrop-blur-xs">
+      {/* One fixed-size shell for every tab: header and actions stay put, the fields scroll. */}
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-title"
+        tabIndex={-1}
+        className="relative flex flex-col w-full max-w-[720px] h-[calc(100dvh-1.5rem)] sm:h-[calc(100dvh-4rem)] [@media(max-height:560px)]:h-[calc(100dvh-1.5rem)] bg-white text-black border border-black shadow-2xl overflow-hidden focus:outline-hidden"
+      >
         {/* Close Button */}
         <button
           type="button"
           onClick={resetAndClose}
-          className="absolute top-5 right-5 text-xl font-light hover:opacity-60 transition-opacity p-2 leading-none"
+          className="absolute z-10 top-3 right-3 sm:top-5 sm:right-5 text-xl font-light hover:opacity-60 transition-opacity p-2 leading-none focus-visible:outline-2 focus-visible:outline-black"
           aria-label="Close form"
         >
           ✕
         </button>
 
         {successMsg ? (
-          <div className="py-8 text-center space-y-5">
+          <div className="flex-1 min-h-0 overflow-y-auto px-5 sm:px-10 py-10 flex flex-col items-center justify-center text-center space-y-5">
             <span className="inline-block text-3xl font-serif">♪</span>
-            <h2 id="modal-title" className="text-2xl font-serif font-medium">
+            <h2 id="modal-title" className="text-2xl sm:text-[28px] leading-tight font-serif font-medium">
               Thank You
             </h2>
             <p className="text-sm text-neutral-700 leading-relaxed max-w-md mx-auto">
@@ -161,25 +250,53 @@ export default function EnquiryModal({
             </div>
           </div>
         ) : (
-          <div>
-            <div className="mb-6 border-b border-black/15 pb-4">
-              <p className="text-[10px] tracking-[0.2em] font-semibold text-neutral-500 uppercase">
+          <>
+            <div className="shrink-0 px-5 pt-5 pb-4 sm:px-10 sm:pt-8 sm:pb-5 [@media(max-height:560px)]:pt-4 [@media(max-height:560px)]:pb-3 border-b border-black/15">
+              <p className="pr-10 mb-2 text-[10px] tracking-[0.2em] font-semibold text-neutral-500 uppercase [@media(max-height:560px)]:hidden">
                 Mozart School Of Western Classical Music
               </p>
-              <h2 id="modal-title" className="text-2xl sm:text-3xl font-serif font-normal mt-1">
-                {type === "lesson" && "Make a Lesson Enquiry"}
-                {type === "location_interest" && "Register Your Location Interest"}
-                {type === "general" && "Send Us a Note"}
-              </h2>
-              <p className="text-xs text-neutral-600 mt-1">
-                {type === "lesson" && "Online and in-person classes are available. Tell us who is learning and what instrument calls to you."}
-                {type === "location_interest" && "In-person classes are coming soon — A welcoming new space is on the way. Register your interest and we’ll keep you informed."}
-                {type === "general" && "Have a question about our classical curriculum or teaching approach? We are here to help."}
-              </p>
+              {/* All three headings share one grid cell, so the header is as tall as the
+                  longest one and does not change height when switching tabs. */}
+              <div className="grid pr-10 sm:pr-0">
+                {headings.map((h) => (
+                  <div
+                    key={h.id}
+                    className={`[grid-area:1/1] ${h.id === type ? "" : "invisible"}`}
+                    aria-hidden={h.id !== type}
+                  >
+                    <h2
+                      id={h.id === type ? "modal-title" : undefined}
+                      className="text-2xl sm:text-[28px] leading-tight font-serif font-normal"
+                    >
+                      {h.title}
+                    </h2>
+                    <p className="text-xs leading-relaxed text-neutral-600 mt-1.5 [@media(max-height:560px)]:hidden">
+                      {h.intro}
+                    </p>
+                  </div>
+                ))}
+              </div>
+
+              {/* Form Type Tabs */}
+              <div className="mt-4 flex border border-black/20 text-[11px]">
+                {tabs.map((tab, index) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setType(tab.id)}
+                    aria-pressed={type === tab.id}
+                    className={`flex-1 min-w-0 px-1 py-2 text-center leading-tight transition ${index > 0 ? "border-l border-black/20" : ""} ${type === tab.id ? "bg-black text-white font-medium" : "bg-transparent text-neutral-600 hover:text-black"}`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
             </div>
 
+            <form onSubmit={handleSubmit} className="flex-1 min-h-0 flex flex-col text-xs">
+              <div ref={bodyRef} className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-5 py-5 sm:px-10 sm:py-6 space-y-5">
             {errorMsg && (
-              <div className="mb-6 p-4 bg-neutral-100 border-l-2 border-black text-xs text-black">
+              <div role="alert" className="p-4 bg-neutral-100 border-l-2 border-black text-xs text-black">
                 <p className="font-semibold">Unable to submit enquiry:</p>
                 <p className="mt-0.5">{errorMsg}</p>
                 <p className="mt-2 text-[11px] text-neutral-600">
@@ -195,7 +312,6 @@ export default function EnquiryModal({
               </div>
             )}
 
-            <form onSubmit={handleSubmit} className="space-y-5 text-xs">
               {/* Hidden Honeypot */}
               <input
                 type="text"
@@ -207,31 +323,6 @@ export default function EnquiryModal({
                 className="hidden"
                 aria-hidden="true"
               />
-
-              {/* Form Type Tabs (if user wants to toggle) */}
-              <div className="flex border border-black/20 text-[11px]">
-                <button
-                  type="button"
-                  onClick={() => setType("lesson")}
-                  className={`flex-1 py-1.5 text-center transition ${type === "lesson" ? "bg-black text-white font-medium" : "bg-transparent text-neutral-600 hover:text-black"}`}
-                >
-                  Lesson Enquiry
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setType("location_interest")}
-                  className={`flex-1 py-1.5 text-center border-l border-black/20 transition ${type === "location_interest" ? "bg-black text-white font-medium" : "bg-transparent text-neutral-600 hover:text-black"}`}
-                >
-                  Location Interest
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setType("general")}
-                  className={`flex-1 py-1.5 text-center border-l border-black/20 transition ${type === "general" ? "bg-black text-white font-medium" : "bg-transparent text-neutral-600 hover:text-black"}`}
-                >
-                  General Note
-                </button>
-              </div>
 
               {/* Lesson Specific: Instrument & Learner Selection */}
               {(type === "lesson" || type === "location_interest") && (
@@ -321,7 +412,7 @@ export default function EnquiryModal({
 
                   {/* Class Preference */}
                   <div>
-                    <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-0.5 mb-1.5">
                       <label className="block text-[11px] font-semibold uppercase tracking-wider">
                         Class Preference *
                       </label>
@@ -384,7 +475,7 @@ export default function EnquiryModal({
               <div className="space-y-3 pt-1">
                 <div>
                   <label className="block text-[11px] font-semibold uppercase tracking-wider mb-1">
-                    {learnerGroup === "child" || learnerGroup === "teen" ? "Parent / Guardian Name *" : "Your Name *"}
+                    {type === "lesson" && (learnerGroup === "child" || learnerGroup === "teen") ? "Parent / Guardian Name *" : "Your Name *"}
                   </label>
                   <input
                     type="text"
@@ -523,8 +614,32 @@ export default function EnquiryModal({
                 )}
               </div>
 
-              {/* Submit Buttons */}
-              <div className="pt-2 flex flex-col sm:flex-row items-center justify-between gap-3 border-t border-black/15">
+              {/* Spam protection */}
+              {needsTurnstile && (
+                <TurnstileWidget
+                  siteKey={appConfig.turnstileSiteKey}
+                  action="enquiry"
+                  onTokenChange={setTurnstileToken}
+                  resetSignal={turnstileReset}
+                />
+              )}
+              {appConfig.mode === "mock" && (
+                <p className="text-[10px] text-neutral-500 italic">
+                  Demo mode: the spam check is skipped and nothing is sent to the school.
+                </p>
+              )}
+              {unavailable && (
+                <div className="p-3 bg-neutral-100 border-l-2 border-black text-[11px] text-black">
+                  Online enquiries are temporarily unavailable. Please call{" "}
+                  <a href="tel:9043877104" className="font-semibold underline">9043877104</a> or email{" "}
+                  <a href="mailto:srinivaschetty@gmail.com" className="font-semibold underline">srinivaschetty@gmail.com</a>.
+                </div>
+              )}
+
+              </div>
+
+              {/* Submit Buttons (always visible below the scrolling fields) */}
+              <div className="shrink-0 px-5 py-3 sm:px-10 sm:py-4 flex flex-col sm:flex-row items-center justify-between gap-2 sm:gap-3 border-t border-black/15 bg-white">
                 <div className="text-[10px] text-neutral-500">
                   Protected by Turnstile & strict privacy.
                 </div>
@@ -538,7 +653,7 @@ export default function EnquiryModal({
                   </button>
                   <button
                     type="submit"
-                    disabled={loading}
+                    disabled={loading || unavailable || (needsTurnstile && !turnstileToken)}
                     className="flex-1 sm:flex-none px-6 py-2.5 bg-black text-white text-xs font-medium tracking-wide uppercase hover:bg-neutral-800 transition disabled:opacity-50"
                   >
                     {loading ? "Sending..." : "Submit Enquiry"}
@@ -546,7 +661,7 @@ export default function EnquiryModal({
                 </div>
               </div>
             </form>
-          </div>
+          </>
         )}
       </div>
     </div>

@@ -34,14 +34,16 @@ export function validateEnquiryPayload(payload: Partial<SubmissionPayload>): {
   const email = (payload.email || "").trim()
   const phone = (payload.phone || "").trim()
 
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+  // Same rule as the database constraint, so valid-looking input is never rejected later.
+  const emailRegex = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i
   if (email && !emailRegex.test(email)) {
     errors.push({ field: "email", message: "Please enter a valid email address." })
   }
 
   if (phone) {
     const cleanedPhone = phone.replace(/[^0-9+() -]/g, "")
-    if (cleanedPhone.length < 7 || cleanedPhone.length > 30) {
+    const digits = cleanedPhone.replace(/\D/g, "").length
+    if (digits < 7 || cleanedPhone.length > 30) {
       errors.push({ field: "phone", message: "Please enter a valid phone number (at least 7 digits)." })
     }
   }

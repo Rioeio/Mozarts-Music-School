@@ -1,7 +1,7 @@
 -- ==============================================================================
 -- MOZART SCHOOL OF WESTERN CLASSICAL MUSIC
 -- Supabase PostgreSQL Schema & Security Migration
--- Migration: 20261005_001_enquiries_schema.sql
+-- Migration: 20261005000001_enquiries_schema.sql
 -- ==============================================================================
 
 -- 1. Create Enums

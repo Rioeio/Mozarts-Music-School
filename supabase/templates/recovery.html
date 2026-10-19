@@ -1,0 +1,7 @@
+<!-- Supabase Auth "Reset password" template. Paste into Authentication > Emails > Reset password.
+     The link opens the dashboard, which verifies the token itself. -->
+<h2>Reset your Mozart School staff password</h2>
+<p>
+  <a href="{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=recovery">Choose a new password</a>
+</p>
+<p>This link can be used once and expires soon. If you did not ask for a reset, you can ignore this email.</p>

@@ -1,16 +1,49 @@
-import { useEffect, useState, useMemo } from "react"
-import { Enquiry, EnquiryStatus, EnquiryType, InstrumentType, StaffMember, StaffRole } from "../lib/types"
-import { supabase, isLiveSupabaseConfigured, mockBackend } from "../lib/supabase"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Enquiry, EnquiryStatus, StaffMember, StaffRole } from "../lib/types"
+import { initialAuthCallback } from "../lib/supabase"
+import { appConfig } from "../lib/config"
+import { adminBackend, MembershipStatus, MIN_PASSWORD_LENGTH, PermissionError, StaffAction } from "../lib/adminBackend"
+import { authErrorMessage, clearAuthCallbackFromUrl, type AuthLinkType } from "../lib/authCallback"
 import { exportEnquiriesToCsv, downloadCsvFile } from "../lib/csv"
 
+type AuthView = "loading" | "signin" | "set_password" | "dashboard"
+
+// Email links are single-use; handle the one in the URL once per page load
+// (React StrictMode runs effects twice in development).
+let authCallbackConsumed = false
+
+function membershipMessage(status: MembershipStatus): string {
+  switch (status) {
+    case "revoked":
+      return "Access revoked: This account is no longer authorized."
+    case "expired":
+      return "Your invitation has expired. Ask an administrator to resend it."
+    case "pending":
+      return "Your invitation has not been activated yet. Use the link in your invitation email."
+    default:
+      return "Access denied: Your account is not in the authorized staff directory."
+  }
+}
+
 export default function AdminDashboard({ onExit }: { onExit: () => void }) {
-  // Auth state
-  const [currentUser, setCurrentUser] = useState<{ id: string; email: string; role: StaffRole; name: string } | null>(null)
+  const backend = adminBackend
+
+  // Auth state. currentUser comes from the database membership check, never from
+  // the browser session alone.
+  const [currentUser, setCurrentUser] = useState<{ id: string; staffId: string; email: string; role: StaffRole; name: string } | null>(null)
+  const [authView, setAuthView] = useState<AuthView>(backend ? "loading" : "signin")
   const [authEmail, setAuthEmail] = useState("")
   const [authPassword, setAuthPassword] = useState("")
   const [authLoading, setAuthLoading] = useState(false)
   const [authError, setAuthError] = useState<string | null>(null)
   const [passwordResetSent, setPasswordResetSent] = useState(false)
+
+  // Password setup after an invitation or recovery link
+  const [passwordMode, setPasswordMode] = useState<AuthLinkType>("invite")
+  const [newPassword, setNewPassword] = useState("")
+  const [confirmPassword, setConfirmPassword] = useState("")
+  // True while an invite/recovery session must set a password before entering.
+  const pendingPasswordRef = useRef(false)
 
   // Navigation tab: 'enquiries' or 'staff'
   const [currentTab, setCurrentTab] = useState<"enquiries" | "staff">("enquiries")
@@ -45,92 +78,139 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
   const [inviteError, setInviteError] = useState<string | null>(null)
   const [inviteSuccess, setInviteSuccess] = useState<string | null>(null)
   const [revokeConfirmId, setRevokeConfirmId] = useState<string | null>(null)
+  const [staffActionId, setStaffActionId] = useState<string | null>(null)
 
-  // Check auth session on mount
+  const isAdmin = currentUser?.role === "admin"
+
+  const clearSession = useCallback(() => {
+    setCurrentUser(null)
+    setSelectedEnquiry(null)
+    setEnquiries([])
+    setStaffMembers([])
+  }, [])
+
+  // Asks the database who the signed-in user is. Called on load, sign-in, token
+  // refresh, focus and whenever the database refuses an action.
+  const refreshMembership = useCallback(async () => {
+    if (!backend || pendingPasswordRef.current) return
+    try {
+      if (!(await backend.hasSession())) {
+        clearSession()
+        setAuthView("signin")
+        return
+      }
+      const membership = await backend.resolveMembership()
+      if (membership.status === "active" && membership.staff) {
+        const staff = membership.staff
+        setCurrentUser((previous) =>
+          previous && previous.id === staff.userId && previous.role === staff.role && previous.name === staff.name
+            ? previous
+            : { id: staff.userId, staffId: staff.staffId, email: staff.email, role: staff.role, name: staff.name },
+        )
+        setAuthView("dashboard")
+        return
+      }
+      if (membership.status === "password_required") {
+        pendingPasswordRef.current = true
+        setPasswordMode("invite")
+        setAuthView("set_password")
+        return
+      }
+      await backend.signOut()
+      clearSession()
+      setAuthError(membershipMessage(membership.status))
+      setAuthView("signin")
+    } catch (err: any) {
+      clearSession()
+      setAuthError("Could not verify your access: " + (err?.message || "unknown error"))
+      setAuthView("signin")
+    }
+  }, [backend, clearSession])
+
+  // Session bootstrap, email-link callbacks and auth events
   useEffect(() => {
-    async function checkSession() {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { data } = await supabase.auth.getSession()
-        if (data?.session?.user) {
-          const userEmail = data.session.user.email || "srinivaschetty@gmail.com"
-          // Check staff_members table
-          const { data: staffData } = await supabase
-            .from("staff_members")
-            .select("role, name, invitation_status")
-            .eq("email", userEmail)
-            .single()
+    if (!backend) return
+    const unsubscribe = backend.onAuthChange((event) => {
+      if (event === "SIGNED_OUT") {
+        pendingPasswordRef.current = false
+        clearSession()
+        setAuthView("signin")
+      } else if (event === "PASSWORD_RECOVERY") {
+        pendingPasswordRef.current = true
+        setPasswordMode("recovery")
+        setAuthView("set_password")
+      } else if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED" || event === "USER_UPDATED") {
+        refreshMembership()
+      }
+    })
 
-          if (staffData && staffData.invitation_status !== "revoked") {
-            setCurrentUser({
-              id: data.session.user.id,
-              email: userEmail,
-              role: staffData.role as StaffRole,
-              name: staffData.name || userEmail.split("@")[0],
-            })
-          } else {
-            // Check fallback in admin_users
-            const { data: adminRecord } = await supabase
-              .from("admin_users")
-              .select("user_id")
-              .eq("user_id", data.session.user.id)
-              .single()
-
-            if (adminRecord) {
-              setCurrentUser({
-                id: data.session.user.id,
-                email: userEmail,
-                role: "admin",
-                name: "Administrator",
-              })
+    async function start() {
+      const callback = authCallbackConsumed ? ({ kind: "none" } as const) : initialAuthCallback
+      authCallbackConsumed = true
+      try {
+        if (callback.kind === "error") {
+          setAuthError(authErrorMessage(callback))
+          clearAuthCallbackFromUrl()
+        } else if (callback.kind === "token_hash") {
+          pendingPasswordRef.current = true
+          await backend!.verifyEmailLink(callback.tokenHash, callback.type)
+          clearAuthCallbackFromUrl()
+          setPasswordMode(callback.type)
+          setAuthView("set_password")
+          return
+        } else if (callback.kind === "session") {
+          clearAuthCallbackFromUrl()
+          if (callback.type) {
+            pendingPasswordRef.current = true
+            if (await backend!.hasSession()) {
+              setPasswordMode(callback.type)
+              setAuthView("set_password")
+              return
             }
+            pendingPasswordRef.current = false
           }
         }
-      } else {
-        const mockUser = mockBackend.getMockUser()
-        if (mockUser) {
-          setCurrentUser(mockUser)
-        }
+      } catch (err: any) {
+        pendingPasswordRef.current = false
+        clearAuthCallbackFromUrl()
+        setAuthError("This link could not be verified: " + (err?.message || "it may have expired") + ". Request a new one below or ask an administrator to resend your invitation.")
       }
+      await refreshMembership()
     }
-    checkSession()
-  }, [])
+    start()
+
+    return unsubscribe
+  }, [backend, clearSession, refreshMembership])
+
+  // Authorization can change while the dashboard is open; re-check on focus.
+  useEffect(() => {
+    if (authView !== "dashboard") return
+    const onFocus = () => refreshMembership()
+    window.addEventListener("focus", onFocus)
+    const interval = window.setInterval(onFocus, 5 * 60 * 1000)
+    return () => {
+      window.removeEventListener("focus", onFocus)
+      window.clearInterval(interval)
+    }
+  }, [authView, refreshMembership])
+
+  // Shows the failure; a permission failure triggers a membership re-check.
+  const reportFailure = (prefix: string, err: any) => {
+    setActionMessage(`${prefix}: ${err?.message || "unknown error"}`)
+    if (err instanceof PermissionError) refreshMembership()
+  }
 
   // Load enquiries
   const fetchEnquiries = async () => {
-    if (!currentUser) return
+    if (!currentUser || !backend) return
     setLoadingData(true)
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { data, error } = await supabase
-          .from("enquiries")
-          .select("*, enquiry_notes(*), notification_jobs(*)")
-          .order("created_at", { ascending: false })
-
-        if (error) {
-          console.error("Failed to load enquiries:", error)
-          setActionMessage("Error fetching enquiries. Ensure your account is authorized.")
-        } else if (data) {
-          const mapped: Enquiry[] = data.map((item: any) => ({
-            ...item,
-            notes: item.enquiry_notes || [],
-            notification_jobs: item.notification_jobs || [],
-          }))
-          setEnquiries(mapped)
-          if (selectedEnquiry) {
-            const updated = mapped.find((e) => e.id === selectedEnquiry.id)
-            if (updated) setSelectedEnquiry(updated)
-          }
-        }
-      } else {
-        const items = mockBackend.getEnquiries()
-        setEnquiries(items)
-        if (selectedEnquiry) {
-          const updated = items.find((e) => e.id === selectedEnquiry.id)
-          if (updated) setSelectedEnquiry(updated)
-        }
-      }
+      const items = await backend.listEnquiries(currentUser.role === "admin")
+      setEnquiries(items)
+      setSelectedEnquiry((selected) => (selected ? items.find((e) => e.id === selected.id) ?? null : null))
     } catch (err: any) {
-      console.error(err)
+      console.error("Failed to load enquiries:", err)
+      reportFailure("Error fetching enquiries", err)
     } finally {
       setLoadingData(false)
     }
@@ -138,26 +218,13 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
 
   // Load staff
   const fetchStaff = async () => {
-    if (!currentUser) return
+    if (!currentUser || !backend || currentUser.role !== "admin") return
     setLoadingStaff(true)
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { data, error } = await supabase
-          .from("staff_members")
-          .select("*")
-          .order("created_at", { ascending: false })
-
-        if (error) {
-          console.error("Failed to load staff members:", error)
-        } else if (data) {
-          setStaffMembers(data)
-        }
-      } else {
-        const list = mockBackend.getStaffMembers()
-        setStaffMembers(list)
-      }
+      setStaffMembers(await backend.listStaff())
     } catch (err: any) {
-      console.error(err)
+      console.error("Failed to load staff members:", err)
+      reportFailure("Error fetching staff", err)
     } finally {
       setLoadingStaff(false)
     }
@@ -173,124 +240,73 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
   // Sign In handler
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!backend) return
     setAuthLoading(true)
     setAuthError(null)
-
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: authEmail,
-          password: authPassword,
-        })
-
-        if (error) {
-          setAuthError(error.message)
-        } else if (data.user) {
-          const email = data.user.email || authEmail
-          const { data: staffRecord } = await supabase
-            .from("staff_members")
-            .select("role, name, invitation_status")
-            .eq("email", email.toLowerCase())
-            .single()
-
-          if (staffRecord) {
-            if (staffRecord.invitation_status === "revoked") {
-              await supabase.auth.signOut()
-              setAuthError("Access revoked: This account is no longer authorized.")
-              return
-            }
-            setCurrentUser({
-              id: data.user.id,
-              email,
-              role: staffRecord.role as StaffRole,
-              name: staffRecord.name || email.split("@")[0],
-            })
-          } else {
-            // Check admin_users fallback
-            const { data: adminRecord } = await supabase
-              .from("admin_users")
-              .select("user_id")
-              .eq("user_id", data.user.id)
-              .single()
-
-            if (!adminRecord) {
-              await supabase.auth.signOut()
-              setAuthError("Access denied: Your account is not in the authorized staff directory.")
-            } else {
-              setCurrentUser({
-                id: data.user.id,
-                email,
-                role: "admin",
-                name: "Administrator",
-              })
-            }
-          }
-        }
-      } else {
-        // Preview mode mock authentication
-        if (authPassword.length < 4) {
-          setAuthError("Please enter a password with at least 4 characters.")
-        } else {
-          const normalizedEmail = authEmail.trim().toLowerCase()
-          const staffList = mockBackend.getStaffMembers()
-          const matched = staffList.find((s) => s.email.toLowerCase() === normalizedEmail)
-
-          if (matched && matched.invitation_status === "revoked") {
-            setAuthError("Access revoked: This account is no longer authorized.")
-            return
-          }
-
-          const role: StaffRole = matched ? matched.role : normalizedEmail.includes("staff") ? "staff" : "admin"
-          const name = matched ? matched.name : role === "admin" ? "Srinivas Chetty (Admin)" : "Staff Member"
-
-          const mockUser = {
-            id: matched?.id || (role === "admin" ? "user-admin" : "user-staff"),
-            email: normalizedEmail || "srinivaschetty@gmail.com",
-            role,
-            name,
-          }
-          mockBackend.setMockUser(mockUser)
-          setCurrentUser(mockUser)
-        }
-      }
+      await backend.signIn(authEmail, authPassword)
+      setAuthPassword("")
+      await refreshMembership()
     } catch (err: any) {
-      setAuthError(err.message || "An unexpected error occurred.")
+      setAuthError(err?.message || "An unexpected error occurred.")
     } finally {
       setAuthLoading(false)
     }
   }
 
-  // Quick switch for Preview mode
-  const handleQuickLogin = (email: string, role: StaffRole, name: string) => {
-    const mockUser = {
-      id: role === "admin" ? "staff-01" : "staff-02",
-      email,
-      role,
-      name,
-    }
-    mockBackend.setMockUser(mockUser)
-    setCurrentUser(mockUser)
+  // Demo mode only
+  const handleQuickLogin = async (role: StaffRole) => {
+    if (!backend?.quickLogin) return
     setAuthError(null)
+    try {
+      await backend.quickLogin(role)
+      await refreshMembership()
+    } catch (err: any) {
+      setAuthError(err?.message || "Demo sign-in failed.")
+    }
   }
 
   // Password Recovery handler
   const handlePasswordReset = async () => {
+    if (!backend) return
     if (!authEmail) {
       setAuthError("Please enter your staff email above to request a reset link.")
       return
     }
     setAuthLoading(true)
+    setAuthError(null)
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { error } = await supabase.auth.resetPasswordForEmail(authEmail)
-        if (error) {
-          setAuthError(error.message)
-        } else {
-          setPasswordResetSent(true)
-        }
-      } else {
-        setPasswordResetSent(true)
-      }
+      await backend.requestPasswordReset(authEmail)
+      setPasswordResetSent(true)
+    } catch (err: any) {
+      setAuthError(err?.message || "Could not send a reset link. Please try again later.")
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  // New password after an invitation or recovery link
+  const handleSetPassword = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!backend) return
+    setAuthError(null)
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      setAuthError(`Please choose a password of at least ${MIN_PASSWORD_LENGTH} characters.`)
+      return
+    }
+    if (newPassword !== confirmPassword) {
+      setAuthError("The two passwords do not match.")
+      return
+    }
+    setAuthLoading(true)
+    try {
+      await backend.updatePassword(newPassword)
+      setNewPassword("")
+      setConfirmPassword("")
+      pendingPasswordRef.current = false
+      await refreshMembership()
+    } catch (err: any) {
+      setAuthError(err?.message || "Could not save your password. Please try again.")
     } finally {
       setAuthLoading(false)
     }
@@ -298,113 +314,79 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
 
   // Sign out handler
   const handleSignOut = async () => {
-    if (isLiveSupabaseConfigured && supabase) {
-      await supabase.auth.signOut()
-    } else {
-      mockBackend.setMockUser(null)
-    }
-    setCurrentUser(null)
-    setSelectedEnquiry(null)
+    pendingPasswordRef.current = false
+    await backend?.signOut()
+    clearSession()
+    setAuthView("signin")
   }
 
   // Update Enquiry Status handler
   const handleStatusChange = async (enquiryId: string, newStatus: EnquiryStatus) => {
-    if (isLiveSupabaseConfigured && supabase) {
-      const { error } = await supabase
-        .from("enquiries")
-        .update({ status: newStatus, updated_at: new Date().toISOString() })
-        .eq("id", enquiryId)
-
-      if (error) {
-        setActionMessage("Failed to update status: " + error.message)
-      } else {
-        fetchEnquiries()
-      }
-    } else {
-      mockBackend.updateStatus(enquiryId, newStatus)
+    if (!backend) return
+    try {
+      await backend.updateStatus(enquiryId, newStatus)
       fetchEnquiries()
+    } catch (err: any) {
+      reportFailure("Failed to update status", err)
     }
   }
 
   // Add Note handler
   const handleAddNote = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!selectedEnquiry || !newNoteText.trim() || !currentUser) return
+    if (!selectedEnquiry || !newNoteText.trim() || !currentUser || !backend) return
 
     setIsSubmittingNote(true)
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { error } = await supabase.from("enquiry_notes").insert({
-          enquiry_id: selectedEnquiry.id,
-          admin_user_id: currentUser.id,
-          admin_email: currentUser.email,
-          note: newNoteText.trim(),
-        })
-
-        if (error) {
-          setActionMessage("Error saving note: " + error.message)
-        } else {
-          setNewNoteText("")
-          fetchEnquiries()
-        }
-      } else {
-        mockBackend.addNote(selectedEnquiry.id, newNoteText.trim(), currentUser.email)
-        setNewNoteText("")
-        fetchEnquiries()
-      }
+      await backend.addNote(selectedEnquiry.id, newNoteText.trim())
+      setNewNoteText("")
+      fetchEnquiries()
+    } catch (err: any) {
+      reportFailure("Error saving note", err)
     } finally {
       setIsSubmittingNote(false)
     }
   }
 
-  // Delete Enquiry handler
+  // Delete Enquiry handler (admin only; enforced by the database)
   const handleDeleteEnquiry = async (id: string) => {
-    if (isLiveSupabaseConfigured && supabase) {
-      const { error } = await supabase.from("enquiries").delete().eq("id", id)
-      if (error) {
-        setActionMessage("Failed to delete record: " + error.message)
-      } else {
-        setDeleteConfirmId(null)
-        if (selectedEnquiry?.id === id) setSelectedEnquiry(null)
-        fetchEnquiries()
-      }
-    } else {
-      mockBackend.deleteEnquiry(id)
+    if (!backend) return
+    try {
+      await backend.deleteEnquiry(id)
       setDeleteConfirmId(null)
       if (selectedEnquiry?.id === id) setSelectedEnquiry(null)
       fetchEnquiries()
+    } catch (err: any) {
+      reportFailure("Failed to delete record", err)
     }
   }
 
-  // Retry notification handler
+  // Retry notification handler (admin only; enforced by the database)
   const handleRetryNotification = async (jobId: string) => {
-    if (isLiveSupabaseConfigured && supabase) {
-      const { error } = await supabase
-        .from("notification_jobs")
-        .update({
-          status: "pending",
-          attempts: 0,
-          next_attempt_at: new Date().toISOString(),
-          last_error: null,
-        })
-        .eq("id", jobId)
-
-      if (error) {
-        setActionMessage("Failed to queue retry: " + error.message)
-      } else {
-        setActionMessage("Notification re-queued for delivery.")
-        fetchEnquiries()
-      }
-    } else {
-      mockBackend.retryNotification(jobId)
-      setActionMessage("Mock notification re-sent successfully.")
+    if (!backend) return
+    try {
+      await backend.retryNotification(jobId)
+      setActionMessage("Notification re-queued for delivery.")
       fetchEnquiries()
+    } catch (err: any) {
+      reportFailure("Failed to queue retry", err)
     }
   }
 
   // -------------------------------------------------------------
-  // Staff Management Actions (Admin Only)
+  // Staff Management Actions (Admin Only, performed by the manage-staff Edge Function)
   // -------------------------------------------------------------
+  const runStaffAction = async (request: StaffAction, staffId: string | null) => {
+    if (!backend) throw new Error("Staff management is unavailable.")
+    setStaffActionId(staffId)
+    try {
+      return await backend.manageStaff(request)
+    } finally {
+      setStaffActionId(null)
+      fetchStaff()
+    }
+  }
+
   const handleInviteStaff = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!currentUser || currentUser.role !== "admin") {
@@ -427,112 +409,43 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
     setInviteSuccess(null)
 
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { error } = await supabase.from("staff_members").insert({
-          name: inviteName.trim(),
-          email: inviteEmail.trim().toLowerCase(),
-          role: inviteRole,
-          invitation_status: "invited",
-        })
-
-        if (error) {
-          setInviteError(error.message)
-        } else {
-          setInviteSuccess(`Invitation successfully dispatched to ${inviteEmail.trim().toLowerCase()}.`)
-          setInviteName("")
-          setInviteEmail("")
-          setShowInviteForm(false)
-          fetchStaff()
-        }
-      } else {
-        mockBackend.inviteStaff(inviteName, inviteEmail, inviteRole)
-        setInviteSuccess(`Invitation successfully sent to ${inviteEmail.trim().toLowerCase()}.`)
-        setInviteName("")
-        setInviteEmail("")
-        setShowInviteForm(false)
-        fetchStaff()
-      }
+      const message = await runStaffAction({ action: "invite", name: inviteName.trim(), email: inviteEmail.trim().toLowerCase(), role: inviteRole }, null)
+      setInviteSuccess(message)
+      setInviteName("")
+      setInviteEmail("")
+      setShowInviteForm(false)
     } catch (err: any) {
-      setInviteError(err.message || "Failed to invite staff member.")
+      setInviteError(err?.message || "Failed to invite staff member.")
     } finally {
       setInviteLoading(false)
     }
   }
 
-  const handleResendInvite = async (id: string, email: string) => {
-    if (!currentUser || currentUser.role !== "admin") return
+  const handleResendInvite = async (id: string) => {
+    if (!isAdmin) return
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { error } = await supabase
-          .from("staff_members")
-          .update({ invited_at: new Date().toISOString() })
-          .eq("id", id)
-
-        if (error) {
-          setActionMessage("Failed to resend invitation: " + error.message)
-        } else {
-          setActionMessage(`Invitation resent to ${email}.`)
-          fetchStaff()
-        }
-      } else {
-        mockBackend.resendInvite(id)
-        setActionMessage(`Invitation resent to ${email}.`)
-        fetchStaff()
-      }
+      setActionMessage(await runStaffAction({ action: "resend", staffId: id }, id))
     } catch (err: any) {
-      setActionMessage("Error: " + err.message)
+      setActionMessage("Failed to resend invitation: " + err.message)
     }
   }
 
-  const handleRevokeStaff = async (id: string, email: string) => {
-    if (!currentUser || currentUser.role !== "admin") return
+  const handleRevokeStaff = async (id: string) => {
+    if (!isAdmin) return
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { error } = await supabase
-          .from("staff_members")
-          .update({ invitation_status: "revoked" })
-          .eq("id", id)
-
-        if (error) {
-          setActionMessage("Failed to revoke staff access: " + error.message)
-        } else {
-          setActionMessage(`Access revoked for ${email}.`)
-          setRevokeConfirmId(null)
-          fetchStaff()
-        }
-      } else {
-        mockBackend.revokeStaff(id)
-        setActionMessage(`Access revoked for ${email}.`)
-        setRevokeConfirmId(null)
-        fetchStaff()
-      }
+      setActionMessage(await runStaffAction({ action: "revoke", staffId: id }, id))
+      setRevokeConfirmId(null)
     } catch (err: any) {
-      setActionMessage("Error: " + err.message)
+      setActionMessage("Failed to revoke staff access: " + err.message)
     }
   }
 
-  const handleReactivateStaff = async (id: string, email: string) => {
-    if (!currentUser || currentUser.role !== "admin") return
+  const handleReactivateStaff = async (id: string) => {
+    if (!isAdmin) return
     try {
-      if (isLiveSupabaseConfigured && supabase) {
-        const { error } = await supabase
-          .from("staff_members")
-          .update({ invitation_status: "active" })
-          .eq("id", id)
-
-        if (error) {
-          setActionMessage("Failed to restore access: " + error.message)
-        } else {
-          setActionMessage(`Access restored for ${email}.`)
-          fetchStaff()
-        }
-      } else {
-        mockBackend.reactivateStaff(id)
-        setActionMessage(`Access restored for ${email}.`)
-        fetchStaff()
-      }
+      setActionMessage(await runStaffAction({ action: "reactivate", staffId: id }, id))
     } catch (err: any) {
-      setActionMessage("Error: " + err.message)
+      setActionMessage("Failed to restore access: " + err.message)
     }
   }
 
@@ -565,42 +478,42 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
   // -------------------------------------------------------------
   // VIEW: Login Screen
   // -------------------------------------------------------------
-  if (!currentUser) {
+  if (authView !== "dashboard" || !currentUser) {
     return (
-      <div className="min-h-screen bg-white text-black flex flex-col justify-center items-center p-6 selection:bg-black selection:text-white">
-        <div className="w-full max-w-md border border-black p-8 sm:p-10 shadow-lg">
+      <div className="min-h-screen bg-white text-black flex flex-col justify-center items-center p-4 sm:p-6 selection:bg-black selection:text-white">
+        <div className="w-full max-w-md border border-black p-6 sm:p-10 shadow-lg">
           <div className="text-center mb-8">
             <span className="inline-block text-3xl font-serif mb-1">M</span>
             <p className="text-[10px] tracking-[0.25em] font-semibold text-neutral-500 uppercase">
               Mozart School Of Western Classical Music
             </p>
-            <h1 className="text-2xl font-serif font-medium mt-2">
+            <h1 className="text-[clamp(1.625rem,7vw,2rem)] leading-[1.15] tracking-[-0.01em] font-serif font-medium mt-3">
               Staff Administration
             </h1>
-            <p className="text-xs text-neutral-600 mt-1">
+            <p className="text-xs text-neutral-600 mt-2">
               Invite-only portal for school staff and enquiry management.
             </p>
-            {!isLiveSupabaseConfigured && (
+            {backend?.kind === "mock" && (
               <div className="mt-4 p-3 bg-neutral-100 border border-black/20 text-[11px] text-neutral-700 text-left space-y-2">
-                <p className="font-semibold text-black">Preview Mode Credentials:</p>
+                <p className="font-semibold text-black">Demo Mode (local development only):</p>
                 <div className="flex gap-2">
                   <button
                     type="button"
-                    onClick={() => handleQuickLogin("srinivaschetty@gmail.com", "admin", "Srinivas Chetty")}
+                    onClick={() => handleQuickLogin("admin")}
                     className="flex-1 py-1.5 px-2 bg-black text-white text-[10px] uppercase tracking-wider font-medium hover:bg-neutral-800 transition"
                   >
                     Login as Admin
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleQuickLogin("radhika@mozartmusic.org", "staff", "Radhika K.")}
+                    onClick={() => handleQuickLogin("staff")}
                     className="flex-1 py-1.5 px-2 border border-black text-black text-[10px] uppercase tracking-wider font-medium hover:bg-neutral-100 transition"
                   >
                     Login as Staff
                   </button>
                 </div>
                 <p className="text-[10px] text-neutral-500">
-                  Or enter any staff email with 4+ character password below.
+                  Demo data is stored only in this browser. Nothing is sent to the school.
                 </p>
               </div>
             )}
@@ -612,10 +525,73 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
             </div>
           )}
 
-          {passwordResetSent ? (
+          {!backend ? (
+            <div className="mb-6 p-4 bg-neutral-100 text-xs text-neutral-800 space-y-2 border border-black/20">
+              <p className="font-semibold text-black">Staff dashboard unavailable</p>
+              <p>This site has not been configured with its Supabase project, so sign-in is disabled.</p>
+              <p className="text-[11px] text-neutral-600">
+                Missing or invalid build settings: {appConfig.errors.join(", ")}. See DEPLOYMENT.md.
+              </p>
+            </div>
+          ) : authView === "loading" ? (
+            <p className="mb-6 text-xs text-neutral-600 text-center">Checking your session…</p>
+          ) : authView === "set_password" ? (
+            <form onSubmit={handleSetPassword} className="space-y-4 text-xs">
+              <div className="p-3 bg-neutral-100 border border-black/20 text-[11px] text-neutral-700">
+                <p className="font-semibold text-black">
+                  {passwordMode === "invite" ? "Welcome — choose a password to activate your staff access" : "Set a new password"}
+                </p>
+                <p className="mt-0.5">At least {MIN_PASSWORD_LENGTH} characters. You will use it with your email to sign in.</p>
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold uppercase tracking-wider mb-1">
+                  New Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                  minLength={MIN_PASSWORD_LENGTH}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="w-full border border-black/30 p-2 text-xs focus:outline-hidden focus:border-black"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold uppercase tracking-wider mb-1">
+                  Confirm Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                  minLength={MIN_PASSWORD_LENGTH}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  className="w-full border border-black/30 p-2 text-xs focus:outline-hidden focus:border-black"
+                />
+              </div>
+              <div className="pt-2 space-y-2">
+                <button
+                  type="submit"
+                  disabled={authLoading}
+                  className="w-full py-2.5 bg-black text-white text-xs font-semibold uppercase tracking-wider hover:bg-neutral-800 transition disabled:opacity-50"
+                >
+                  {authLoading ? "Saving..." : passwordMode === "invite" ? "Save Password & Continue" : "Save New Password"}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  className="w-full text-[11px] text-neutral-600 hover:text-black underline"
+                >
+                  Cancel and sign out
+                </button>
+              </div>
+            </form>
+          ) : passwordResetSent ? (
             <div className="mb-6 p-4 bg-neutral-100 text-xs text-neutral-800 space-y-2 border border-black/20">
               <p className="font-semibold text-black">Password reset requested</p>
-              <p>If an approved staff account exists for {authEmail}, a secure password reset link has been dispatched.</p>
+              <p>If a staff account exists for {authEmail}, a password reset link has been emailed. It opens this dashboard so you can choose a new password.</p>
               <button
                 type="button"
                 onClick={() => setPasswordResetSent(false)}
@@ -700,7 +676,7 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
           <span className="font-serif text-2xl font-semibold">M</span>
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-sm font-semibold tracking-wide uppercase">
+              <h1 className="font-sans text-sm font-semibold tracking-wide uppercase">
                 Mozart School Administration
               </h1>
               <span className={`px-2 py-0.5 text-[9px] uppercase tracking-wider font-semibold ${
@@ -715,7 +691,7 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
               Logged in as <span className="font-medium text-black">{currentUser.email}</span>
               {" "}·{" "}
               <span className="inline-block px-1.5 py-0.2 border border-black/30 text-[9px] uppercase tracking-wider">
-                {isLiveSupabaseConfigured ? "Live Supabase" : "Mock Storage"}
+                {backend?.kind === "mock" ? "Demo Mode · Browser Only" : "Live Supabase"}
               </span>
             </p>
           </div>
@@ -750,11 +726,11 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
       </header>
 
       {/* Tab Navigation */}
-      <div className="flex border-b border-black bg-white px-6">
+      <div className="flex border-b border-black bg-white px-2 sm:px-6 overflow-x-auto">
         <button
           type="button"
           onClick={() => setCurrentTab("enquiries")}
-          className={`py-3 px-5 text-xs font-semibold uppercase tracking-wider border-b-2 transition -mb-px flex items-center gap-2 ${
+          className={`py-3 px-3 sm:px-5 whitespace-nowrap text-xs font-semibold uppercase tracking-wider border-b-2 transition -mb-px flex items-center gap-2 ${
             currentTab === "enquiries"
               ? "border-black text-black"
               : "border-transparent text-neutral-500 hover:text-black"
@@ -768,7 +744,7 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
         <button
           type="button"
           onClick={() => setCurrentTab("staff")}
-          className={`py-3 px-5 text-xs font-semibold uppercase tracking-wider border-b-2 transition -mb-px flex items-center gap-2 ${
+          className={`py-3 px-3 sm:px-5 whitespace-nowrap text-xs font-semibold uppercase tracking-wider border-b-2 transition -mb-px flex items-center gap-2 ${
             currentTab === "staff"
               ? "border-black text-black"
               : "border-transparent text-neutral-500 hover:text-black"
@@ -1077,9 +1053,10 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                   </div>
                 </div>
 
-                {/* Notification Jobs Section */}
+                {/* Notification Jobs Section (administrators only) */}
+                {isAdmin && (
                 <div className="space-y-3">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-black">
+                  <h3 className="font-sans text-xs font-semibold uppercase tracking-wider text-black">
                     Transactional Notifications
                   </h3>
                   {selectedEnquiry.notification_jobs && selectedEnquiry.notification_jobs.length > 0 ? (
@@ -1130,11 +1107,12 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                     <p className="text-xs text-neutral-500 italic">No notification records queued for this enquiry.</p>
                   )}
                 </div>
+                )}
 
                 {/* Private Staff Notes */}
                 <div className="space-y-4">
                   <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-semibold uppercase tracking-wider text-black">
+                    <h3 className="font-sans text-xs font-semibold uppercase tracking-wider text-black">
                       Private Staff Notes
                     </h3>
                     <span className="text-[10px] text-neutral-500 italic">Staff access only · Never visible to visitors</span>
@@ -1179,7 +1157,8 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                   </div>
                 </div>
 
-                {/* Controlled Deletion Controls (GDPR / Privacy) */}
+                {/* Controlled Deletion Controls (GDPR / Privacy; administrators only) */}
+                {isAdmin && (
                 <div className="pt-8 border-t border-black/15 flex justify-between items-center">
                   <div>
                     <h4 className="text-xs font-semibold uppercase tracking-wider text-black">
@@ -1217,6 +1196,7 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                     </button>
                   )}
                 </div>
+                )}
               </div>
             )}
           </div>
@@ -1234,7 +1214,7 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
               <span className="text-3xl font-serif">M</span>
               <h2 className="text-xl font-serif font-medium">Administrator Access Required</h2>
               <p className="text-xs text-neutral-600 leading-relaxed">
-                You are currently signed in as <span className="font-semibold text-black">{currentUser.email}</span> with standard <strong>Staff</strong> permissions. Staff members can view and manage all student enquiries and private notes, but cannot invite, modify, or revoke staff accounts.
+                You are currently signed in as <span className="font-semibold text-black">{currentUser.email}</span> with standard <strong>Staff</strong> permissions. Staff members can view all enquiries, update their status, and add private notes, but cannot delete enquiries, retry notifications, or invite, modify, or revoke staff accounts.
               </p>
               <div className="p-3 bg-neutral-100 border border-black/20 text-[11px] text-neutral-700 max-w-md mx-auto text-left">
                 <strong>Need access changes?</strong> Contact authorized administrator Srinivas Chetty (<a href="mailto:srinivaschetty@gmail.com" className="underline font-medium">srinivaschetty@gmail.com</a>) to update team accounts.
@@ -1318,7 +1298,7 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
               {showInviteForm && (
                 <div className="border border-black p-6 bg-white shadow-sm space-y-4">
                   <div className="border-b border-black/15 pb-2 flex justify-between items-center">
-                    <h3 className="text-xs font-semibold uppercase tracking-wider">
+                    <h3 className="font-sans text-xs font-semibold uppercase tracking-wider">
                       Invite a New School Staff Member
                     </h3>
                     <span className="text-[10px] text-neutral-500">Email Invitation Flow</span>
@@ -1430,7 +1410,7 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
               <div className="border border-black overflow-hidden">
                 <div className="p-4 bg-neutral-50 border-b border-black flex justify-between items-center text-xs">
                   <div>
-                    <h3 className="font-semibold uppercase tracking-wider text-black">
+                    <h3 className="font-sans font-semibold uppercase tracking-wider text-black">
                       Staff Directory ({staffMembers.length})
                     </h3>
                     <p className="text-[11px] text-neutral-500">
@@ -1463,7 +1443,8 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                       </thead>
                       <tbody className="divide-y divide-black/10 bg-white">
                         {staffMembers.map((staff) => {
-                          const isSelf = staff.email.toLowerCase() === currentUser.email.toLowerCase()
+                          const isSelf = staff.user_id === currentUser.id
+                          const busy = staffActionId === staff.id
                           return (
                             <tr key={staff.id} className="hover:bg-neutral-50/70 transition">
                               <td className="p-3.5 pl-4 font-semibold text-black">
@@ -1506,7 +1487,8 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                                 {staff.invitation_status === "invited" && (
                                   <button
                                     type="button"
-                                    onClick={() => handleResendInvite(staff.id, staff.email)}
+                                    onClick={() => handleResendInvite(staff.id)}
+                                    disabled={busy}
                                     className="px-2.5 py-1 border border-black text-[10px] uppercase font-semibold hover:bg-neutral-100 transition"
                                   >
                                     Resend Invite
@@ -1518,7 +1500,8 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                                     <span className="inline-flex items-center gap-1">
                                       <button
                                         type="button"
-                                        onClick={() => handleRevokeStaff(staff.id, staff.email)}
+                                        onClick={() => handleRevokeStaff(staff.id)}
+                                        disabled={busy}
                                         className="px-2 py-1 bg-black text-white text-[10px] uppercase font-semibold hover:bg-neutral-800 transition"
                                       >
                                         Confirm Revoke
@@ -1545,7 +1528,8 @@ export default function AdminDashboard({ onExit }: { onExit: () => void }) {
                                 {staff.invitation_status === "revoked" && !isSelf && (
                                   <button
                                     type="button"
-                                    onClick={() => handleReactivateStaff(staff.id, staff.email)}
+                                    onClick={() => handleReactivateStaff(staff.id)}
+                                    disabled={busy}
                                     className="px-2.5 py-1 border border-black text-[10px] uppercase font-semibold hover:bg-neutral-100 transition"
                                   >
                                     Reactivate

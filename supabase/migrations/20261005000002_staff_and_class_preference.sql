@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- MOZART SCHOOL OF WESTERN CLASSICAL MUSIC
--- Migration: 20261005_002_staff_and_class_preference.sql
+-- Migration: 20261005000002_staff_and_class_preference.sql
 -- Adds class preference support and school staff access management
 -- ==============================================================================
 

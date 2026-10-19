@@ -1,13 +1,22 @@
 {
-  "name": "figma-make-app",
+  "name": "mozarts-music-school",
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "packageManager": "npm@11.9.0",
+  "engines": {
+    "node": "24.x"
+  },
   "scripts": {
     "dev": "vite",
+    "dev:mock": "vite --mode mock",
     "build": "vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p .",
     "test": "vitest run",
+    "test:db": "node scripts/test-db.mjs",
+    "check:functions": "npx -y deno@2 check supabase/functions/submit-enquiry/index.ts supabase/functions/process-notifications/index.ts supabase/functions/manage-staff/index.ts",
+    "check": "npm run typecheck && npm run test && npm run build",
     "format": "oxfmt"
   },
   "dependencies": {

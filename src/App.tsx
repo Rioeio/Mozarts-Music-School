@@ -3,6 +3,8 @@ import EnquiryModal from "./components/EnquiryModal"
 import PrivacyNoticeModal from "./components/PrivacyNoticeModal"
 import AdminDashboard from "./components/AdminDashboard"
 import { EnquiryType, InstrumentType } from "./lib/types"
+import { appConfig } from "./lib/config"
+import { initialAuthCallback } from "./lib/supabase"
 
 const lessons = [
   {
@@ -64,14 +66,35 @@ function Brand({ footer = false }: { footer?: boolean }) {
   )
 }
 
+// Development-only demo indicator: data stays in this browser.
+function DemoModeBanner() {
+  if (appConfig.mode !== "mock") return null
+  return (
+    <div
+      role="status"
+      className="fixed bottom-3 left-3 z-40 max-w-xs bg-black text-white text-[11px] leading-snug px-3 py-2 shadow-lg"
+    >
+      <strong className="uppercase tracking-wider">Demo mode</strong> — enquiries and staff data are stored only in
+      this browser and are not sent to the school.
+    </div>
+  )
+}
+
+// /admin, #admin, or an auth email link (which may land on the site root when
+// Supabase falls back to the Site URL).
+function isAdminLocation(): boolean {
+  return (
+    window.location.pathname.startsWith("/admin") ||
+    window.location.hash === "#admin" ||
+    initialAuthCallback.kind !== "none"
+  )
+}
+
 export default function App() {
   const [menuOpen, setMenuOpen] = useState(false)
 
   // Route state for private admin dashboard (/admin or #admin)
-  const [isAdminRoute, setIsAdminRoute] = useState(
-    typeof window !== "undefined" &&
-      (window.location.pathname.startsWith("/admin") || window.location.hash === "#admin")
-  )
+  const [isAdminRoute, setIsAdminRoute] = useState(() => typeof window !== "undefined" && isAdminLocation())
 
   // Enquiry modal state
   const [enquiryModalOpen, setEnquiryModalOpen] = useState(false)
@@ -90,9 +113,7 @@ export default function App() {
   // Listen for hash/popstate changes for admin route
   useEffect(() => {
     const handleRouteChange = () => {
-      setIsAdminRoute(
-        window.location.pathname.startsWith("/admin") || window.location.hash === "#admin"
-      )
+      setIsAdminRoute(window.location.pathname.startsWith("/admin") || window.location.hash === "#admin")
     }
     window.addEventListener("hashchange", handleRouteChange)
     window.addEventListener("popstate", handleRouteChange)
@@ -130,6 +151,8 @@ export default function App() {
   // If user navigated to /admin or #admin, render the protected admin area
   if (isAdminRoute) {
     return (
+      <>
+      <DemoModeBanner />
       <AdminDashboard
         onExit={() => {
           if (window.location.hash === "#admin") {
@@ -141,11 +164,13 @@ export default function App() {
           setIsAdminRoute(false)
         }}
       />
+      </>
     )
   }
 
   return (
     <>
+      <DemoModeBanner />
       <header className="site-header">
         <Brand />
         <button

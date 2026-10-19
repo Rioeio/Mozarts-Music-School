@@ -28,6 +28,8 @@ export interface StaffMember {
   role: StaffRole
   invitation_status: StaffInvitationStatus
   invited_at: string
+  invite_expires_at?: string | null
+  accepted_at?: string | null
   created_at: string
 }
 
